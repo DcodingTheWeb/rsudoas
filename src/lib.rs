@@ -159,14 +159,14 @@ pub mod command {
 pub mod config {
 	use std::collections::HashMap;
 	
-	#[derive(Clone, Debug)]
+	#[derive(Clone, Debug, PartialEq, Eq)]
 	pub enum RuleAction {
-		Permit,
 		Deny,
+		PermitWithPassword,
+		PermitWithoutPassword,
 	}
 	#[derive(Clone, Debug)]
 	pub struct RuleOpts {
-		pub nopass: bool,
 		pub nolog: bool,
 		pub persist: bool,
 		pub keepenv: bool,
@@ -188,70 +188,45 @@ pub mod config {
 		pub args: Option<Vec<String>>,
 	}
 	
-	#[derive(Clone, Debug)]
-	pub struct Rules {
-		pub allowed: Vec<Rule>,
-		pub denied: Vec<Rule>,
-	}
-	
-	impl Rules {
-		pub fn r#match<'a>(&self,
+	impl Rule {
+		pub fn matches(&self,
 			user: &str,
-			groups: &'a [impl AsRef<str>],
+			groups: &[impl AsRef<str>],
 			cmd: &str,
-			args: &'a [impl AsRef<str>],
+			args: &[impl AsRef<str>],
 			target: &str,
-		) -> Option<RuleOpts> {
-			let match_rules = |rules: &[Rule]| -> Option<RuleOpts> {
-				let mut matched: Option<&Rule> = None;
-				for rule in rules {
-					match &rule.identity {
-						RuleIdentity::User(rule_user) => if rule_user != user {
-							continue;
-						},
-						RuleIdentity::Group(group) => if !groups.iter().any(|x| x.as_ref() == group) {
-							continue;
-						},
-					}
-					if let Some(rule_cmd) = &rule.command {
-						if rule_cmd != cmd {
-							continue;
-						}
-					}
-					if let Some(rule_args) = &rule.args {
-						if rule_args.iter().zip(args).all(|(x, y)| x == y.as_ref()) {
-							continue;
-						}
-					}
-					if let Some(rule_target) = &rule.target {
-						if rule_target != target {
-							continue;
-						}
-					}
-					matched = Some(rule);
-				}
-				match matched {
-					Some(rule) => Some(rule.options.clone()),
-					None => None,
-				}
-			};
-			let matched = match_rules(&self.allowed);
-			if matched.is_some() && match_rules(&self.denied).is_none() {
-				matched
-			} else {
-				None
+		) -> bool {
+			match &self.identity {
+				RuleIdentity::User(rule_user) => if rule_user != user {
+					return false;
+				},
+				RuleIdentity::Group(group) => if !groups.iter().any(|x| x.as_ref() == group) {
+					return false;
+				},
 			}
+			if let Some(rule_cmd) = &self.command {
+				if rule_cmd != cmd {
+					return false;
+				}
+			}
+			if let Some(rule_args) = &self.args {
+				if rule_args.iter().zip(args).all(|(x, y)| x == y.as_ref()) {
+					return false;
+				}
+			}
+			if let Some(rule_target) = &self.target {
+				if rule_target != target {
+					return false;
+				}
+			}
+			true
 		}
 	}
 	
-	impl TryFrom<&str> for Rules {
-		type Error = String;
-		
-		fn try_from(config: &str) -> Result<Self, Self::Error> {
+		pub fn parse_into_rules(config: &str) -> Result<Vec<Rule>, String> {
 			const DEFAULT_RULE: Rule = Rule {
 				action: RuleAction::Deny,
 				options: RuleOpts {
-					nopass: false,
 					nolog: false,
 					persist: false,
 					keepenv: false,
@@ -263,10 +238,7 @@ pub mod config {
 				args: None,
 			};
 			
-			let mut rules = Rules {
-				allowed: Vec::new(),
-				denied: Vec::new(),
-			};
+			let mut rules = Vec::new();
 			
 			enum Expect {
 				Permission,
@@ -278,13 +250,6 @@ pub mod config {
 			let mut state = Expect::Permission;
 			let mut new_rule = false;
 			let mut rule: Rule = DEFAULT_RULE.clone();
-			let mut push_rule = |rule: &mut Rule| {
-				let value = std::mem::replace(rule, DEFAULT_RULE.clone());
-				match value.action {
-					RuleAction::Permit => rules.allowed.push(value),
-					RuleAction::Deny => rules.denied.push(value),
-				};
-			};
 			while let Some((token, pure)) = tokens.next() {
 				if new_rule {
 					rule = DEFAULT_RULE.clone();
@@ -295,7 +260,7 @@ pub mod config {
 					Expect::Permission => {
 						if pure {
 							if token == "permit" {
-								rule.action = RuleAction::Permit;
+								rule.action = RuleAction::PermitWithPassword;
 							} else if token == "deny" {
 								rule.action = RuleAction::Deny;
 							} else {
@@ -308,7 +273,10 @@ pub mod config {
 					},
 					Expect::OptionOrIdentity => {
 						match (&*token, pure) {
-							("nopass", true) => rule.options.nopass = true,
+							("nopass", true) => match rule.action {
+								RuleAction::Deny => return Err("The nopass option cannot be used with the deny action".to_string()),
+								_ => rule.action = RuleAction::PermitWithoutPassword,
+							},
 							("nolog", true) => rule.options.nolog = true,
 							("persist", true) => rule.options.persist = true,
 							("keepenv", true) => rule.options.keepenv = true,
@@ -352,14 +320,9 @@ pub mod config {
 					},
 				}
 				if tokens.line_ended {
-					push_rule(&mut rule);
+					rules.push(std::mem::replace(&mut rule, DEFAULT_RULE.clone()));
 					new_rule = true;
 				}
-			}
-			
-			if !new_rule {
-				// Push the leftover rule (happens when config doesn't end with a NL)
-				push_rule(&mut rule);
 			}
 			
 			return Ok(rules);
@@ -470,5 +433,4 @@ pub mod config {
 				}
 			}
 		}
-	}
 }
