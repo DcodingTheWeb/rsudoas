@@ -57,8 +57,9 @@ fn execute(opts: Execute) {
 			config_file = file;
 		},
 	}
-	let config = std::fs::read_to_string(config_file).expect("Failed to read config");
-	let rules = match Rules::try_from(&*config) {
+	// Make sure the config file ends with a newline.
+	let config = std::fs::read_to_string(config_file).expect("Failed to read config") + "\n";
+	let rules = match config::parse_into_rules(&config) {
 		Ok(x) => x,
 		Err(_) => print_error_and_exit("Error parsing config", 1),
 	};
@@ -79,32 +80,39 @@ fn execute(opts: Execute) {
 		Some(x) => x,
 		None => passwd_target.shell.clone(),
 	};
-	let matched = rules.r#match(user, &groups, &*cmd, &opts.args, &opts.user);
+	let matching_rule = rules.into_iter().rev().find(|rule|
+		rule.matches(user, &groups, &cmd, &opts.args, &opts.user)
+	);
+	let action = match matching_rule {
+		None => RuleAction::Deny,
+		Some(ref rule) => rule.action.clone(),
+	};
+	
 	if only_check {
-		match matched {
-			None => println!("deny"),
-			Some(rule_opts) => {
-				println!("permit{}", if rule_opts.nopass {" nopass"} else {""});
-			},
+		match action {
+			RuleAction::Deny => println!("deny"),
+			RuleAction::PermitWithPassword => println!("permit"),
+			RuleAction::PermitWithoutPassword => println!("permit nopass"),
 		}
 		return;
 	}
+
+	if action == RuleAction::Deny {
+		let cmdline = get_cmdline(&cmd, &opts.args);
+		let msg = format!("command not permitted for {}: {}", &user, &cmdline);
+		syslog(libc::LOG_AUTHPRIV | libc::LOG_NOTICE, &msg);
+		print_error_and_exit("Not permitted", 1);
+	}
 	
-	let rule_opts = match matched {
-		None => {
-			let cmdline = get_cmdline(&cmd, &opts.args);
-			let msg = format!("command not permitted for {}: {}", &user, &cmdline);
-			syslog(libc::LOG_AUTHPRIV | libc::LOG_NOTICE, &msg);
-			print_error_and_exit("Not permitted", 1);
-		},
-		Some(match_opts) => match_opts,
-	};
-	if !rule_opts.nopass {
+	if action == RuleAction::PermitWithPassword {
 		if !challenge_user(&passwd) {
 			eprintln!("Authentication failed");
 			return;
 		}
 	}
+
+	let rule_opts = matching_rule.unwrap().options;
+
 	if !rule_opts.nolog {
 		let cmdline = get_cmdline(&cmd, &opts.args);
 		let cwd = env::current_dir();
