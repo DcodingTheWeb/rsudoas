@@ -219,7 +219,10 @@ pub mod config {
 						}
 					}
 					if let Some(rule_args) = &rule.args {
-						if rule_args.iter().zip(args).all(|(x, y)| x == y.as_ref()) {
+						if rule_args.len() != args.iter().count() {
+							continue;
+						}
+						if !rule_args.iter().zip(args).all(|(x, y)| x == y.as_ref()) {
 							continue;
 						}
 					}
