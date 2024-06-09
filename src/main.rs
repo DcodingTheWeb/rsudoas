@@ -99,84 +99,157 @@ fn execute(opts: Execute) {
 		},
 		Some(match_opts) => match_opts,
 	};
-	if !rule_opts.nopass {
-		if !challenge_user(&passwd) {
-			eprintln!("Authentication failed");
-			return;
-		}
-	}
-	if !rule_opts.nolog {
-		let cmdline = get_cmdline(&cmd, &opts.args);
-		let cwd = env::current_dir();
-		let cwd = match &cwd {
-			Ok(dir) => dir.to_str().unwrap_or("(invalid utf8)"),
-			Err(_) => "(failed)",
-		};
-		let msg = format!("{} ran command {} as {} from {}", &user, &cmdline, &opts.user, &cwd);
-		syslog(libc::LOG_AUTHPRIV | libc::LOG_INFO, &msg);
-	}
 	
-	let cmd_cstr;
-	unsafe {
-		libc::setenv(
-			CString::new("PATH").unwrap_unchecked().as_ptr(),
-			CString::new(SAFE_PATH).unwrap_unchecked().as_ptr(),
-			1,
-		);
-		cmd_cstr = CString::new(cmd.clone()).unwrap_unchecked();
-	}
-	let arg_cstrs: Vec<_> = opts.args.iter().map(|arg| CString::new(arg.as_bytes()).unwrap()).collect();
-	let mut arg_ptrs = vec![cmd_cstr.as_ptr()];
-	arg_ptrs.extend(arg_cstrs.iter().map(|arg| arg.as_ptr()));
-	arg_ptrs.push(ptr::null());
-	
-	let mut env_cstrs = vec![
-		env_cstr("DOAS_USER", &passwd.name),
-		env_cstr("HOME", &passwd_target.dir),
-		env_cstr("LOGNAME", &passwd_target.name),
-		env_cstr("PATH", SAFE_PATH),
-		env_cstr("SHELL", &passwd_target.shell),
-		env_cstr("USER", &passwd_target.name),
-	];
-	for var in ["DISPLAY", "TERM"] {
-		if let Ok(value) = env::var(var) {
-			let var_cstr = env_cstr(var, &value);
-			env_cstrs.push(var_cstr);
+	let run = |cleanup: Option<Box<dyn FnOnce()>>| {
+		if !rule_opts.nolog {
+			let cmdline = get_cmdline(&cmd, &opts.args);
+			let cwd = env::current_dir();
+			let cwd = match &cwd {
+				Ok(dir) => dir.to_str().unwrap_or("(invalid utf8)"),
+				Err(_) => "(failed)",
+			};
+			let msg = format!("{} ran command {} as {} from {}", &user, &cmdline, &opts.user, &cwd);
+			syslog(libc::LOG_AUTHPRIV | libc::LOG_INFO, &msg);
 		}
-	}
-	match rule_opts.setenv {
-		Some(mut env) => {
-			if rule_opts.keepenv {
-				for (key, value) in env::vars() {
-					if !env.contains_key(&key) {
-						env.insert(key, value);
+		
+		let cmd_cstr;
+		unsafe {
+			libc::setenv(
+				CString::new("PATH").unwrap_unchecked().as_ptr(),
+				CString::new(SAFE_PATH).unwrap_unchecked().as_ptr(),
+				1,
+			);
+			cmd_cstr = CString::new(cmd.clone()).unwrap_unchecked();
+		}
+		let arg_cstrs: Vec<_> = opts.args.iter().map(|arg| CString::new(arg.as_bytes()).unwrap()).collect();
+		let mut arg_ptrs = vec![cmd_cstr.as_ptr()];
+		arg_ptrs.extend(arg_cstrs.iter().map(|arg| arg.as_ptr()));
+		arg_ptrs.push(ptr::null());
+		
+		let mut env_cstrs = vec![
+			env_cstr("DOAS_USER", &passwd.name),
+			env_cstr("HOME", &passwd_target.dir),
+			env_cstr("LOGNAME", &passwd_target.name),
+			env_cstr("PATH", SAFE_PATH),
+			env_cstr("SHELL", &passwd_target.shell),
+			env_cstr("USER", &passwd_target.name),
+		];
+		for var in ["DISPLAY", "TERM"] {
+			if let Ok(value) = env::var(var) {
+				let var_cstr = env_cstr(var, &value);
+				env_cstrs.push(var_cstr);
+			}
+		}
+		match rule_opts.setenv {
+			Some(mut env) => {
+				if rule_opts.keepenv {
+					for (key, value) in env::vars() {
+						if !env.contains_key(&key) {
+							env.insert(key, value);
+						}
 					}
 				}
+				env_cstrs.extend(env.iter().map(|(&ref key, &ref value)| env_cstr(key, value)));
+			},
+			None => (),
+		}
+		let mut env_ptrs: Vec<_> = env_cstrs.iter().map(|arg| arg.as_ptr()).collect();
+		env_ptrs.push(ptr::null());
+		
+		unsafe {
+			if libc::setresgid(passwd_target.gid, passwd_target.gid, passwd_target.gid) != 0 {
+				print_error_and_exit("setresgid", 1);
 			}
-			env_cstrs.extend(env.iter().map(|(&ref key, &ref value)| env_cstr(key, value)));
-		},
-		None => (),
-	}
-	let mut env_ptrs: Vec<_> = env_cstrs.iter().map(|arg| arg.as_ptr()).collect();
-	env_ptrs.push(ptr::null());
+			let target_name = CString::new(passwd_target.name.clone()).unwrap();
+			if libc::initgroups(target_name.as_ptr(), passwd_target.gid) != 0 {
+				print_error_and_exit("initgroups", 1);
+			}
+			if libc::setresuid(passwd_target.uid, passwd_target.uid, passwd_target.uid) != 0 {
+				print_error_and_exit("setresuid", 1);
+			}
+			env::set_var("PATH", SAFE_PATH);
+			let child_pid = libc::fork();
+			match child_pid {
+				-1 => panic!("Failed to start child process!"),
+				0 => {
+					libc::execvpe(
+						cmd_cstr.as_ptr(),
+						arg_ptrs.as_ptr(),
+						env_ptrs.as_ptr(),
+					);
+				},
+				_ => (),
+			}
+			
+			// Wait for child to exit
+			libc::waitpid(child_pid, std::ptr::null::<libc::c_int>() as *mut i32, 0);
+		}
+		
+		if let Some(cleanup) = cleanup {
+			cleanup();
+		}
+	};
 	
-	unsafe {
-		if libc::setresgid(passwd_target.gid, passwd_target.gid, passwd_target.gid) != 0 {
-			print_error_and_exit("setresgid", 1);
+	#[cfg(auth = "none")]
+	{
+		if !rule_opts.nopass {
+			eprintln!("This command requires authentication but this version of rsudoas was built without any authentication methods!");
+			return;
 		}
-		let target_name = CString::new(passwd_target.name.clone()).unwrap();
-		if libc::initgroups(target_name.as_ptr(), passwd_target.gid) != 0 {
-			print_error_and_exit("initgroups", 1);
+		
+		run(None);
+	}
+	
+	#[cfg(auth = "pam")]
+	{
+		use pam_client;
+		
+		let mut pam_context;
+		let mut pam_session = None;
+		
+		if !rule_opts.nopass {
+			match authenticate(&passwd, &passwd_target) {
+				Ok(transaction) => {
+					pam_context = transaction.context.unwrap();
+					
+					// Start a PAM session
+					pam_session = Some(pam_context.open_session(pam_client::Flag::NONE).expect("Failed to start PAM session"));
+				},
+				Err(_) => {
+					// TODO: Syslog
+					eprintln!("Authentication failed");
+					return;
+				},
+			}
 		}
-		if libc::setresuid(passwd_target.uid, passwd_target.uid, passwd_target.uid) != 0 {
-			print_error_and_exit("setresuid", 1);
+		
+		run(Some(Box::new(|| {
+			// Close the PAM session
+			if let Some(session) = pam_session {
+				let _ = session.close(pam_client::Flag::NONE);
+			}
+		})));
+		
+		fn authenticate<'a>(source: &'a pwd_grp::Passwd, target: &'a pwd_grp::Passwd) -> Result<Transaction<'a>, ()> {
+			let mut transaction = Transaction::new();
+			
+			match transaction.begin(&source, &target) {
+				Ok(_) => Ok(transaction),
+				Err(_) => Err(()),
+			}
 		}
-		env::set_var("PATH", SAFE_PATH);
-		libc::execvpe(
-			cmd_cstr.as_ptr(),
-			arg_ptrs.as_ptr(),
-			env_ptrs.as_ptr(),
-		);
+	}
+	
+	#[cfg(auth = "plain")]
+	{
+		if !rule_opts.nopass {
+			if !challenge_user(&passwd) {
+				eprintln!("Authentication failed");
+				return;
+			}
+		}
+		
+		run(None);
 	}
 	
 	fn env_cstr(key: &str, value: &str) -> CString {

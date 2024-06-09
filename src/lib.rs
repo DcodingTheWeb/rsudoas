@@ -16,6 +16,7 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+#[cfg(auth = "plain")]
 pub mod auth {
     use std::{ffi::{CStr, CString}, io::Write};
 	
@@ -57,6 +58,107 @@ pub mod auth {
 			let result = crypt(response.as_ptr(), hash.as_ptr());
 			let result = CStr::from_ptr(result).to_str().unwrap_unchecked();
 			result == hash.to_str().unwrap_unchecked()
+		}
+	}
+}
+
+#[cfg(auth = "pam")]
+pub mod auth {
+	use std::{ffi::{CStr, CString}, io::Write};
+	
+	use nix;
+	use pam_client::{Context, ConversationHandler, ErrorCode, Flag};
+	use pwd_grp::Passwd;
+	use rpassword::read_password;
+	
+	pub struct Converser<'a> {
+		pub username: &'a str,
+	}
+	
+	impl ConversationHandler for Converser<'_> {
+		fn prompt_echo_on(&mut self, _msg: &CStr) -> Result<CString, ErrorCode> {
+			let username = String::from(self.username);
+			
+			CString::new(username).map_err(|_| ErrorCode::CONV_ERR)
+		}
+		
+		fn prompt_echo_off(&mut self, _msg: &CStr) -> Result<CString, ErrorCode> {
+			let hostname = nix::unistd::gethostname().expect("Failed to get hostname");
+			let hostname = hostname.into_string().expect("Hostname is not valid UTF-8");
+			print!("rsudoas ({}@{}) password: ", &self.username, &hostname);
+			std::io::stdout().flush().unwrap();
+			let password = read_password().map_err(|_| ErrorCode::CONV_ERR)?;
+			
+			CString::new(password).map_err(|_| ErrorCode::CONV_ERR)
+		}
+		
+		fn text_info(&mut self, msg: &CStr) {
+			let msg = String::from_utf8_lossy(msg.to_bytes()).to_string();
+			println!("PAM Info: {}", &msg);
+		}
+		
+		fn error_msg(&mut self, msg: &std::ffi::CStr) {
+			let msg = String::from_utf8_lossy(msg.to_bytes()).to_string();
+			eprintln!("PAM Error: {}", &msg);
+		}
+		
+	}
+	
+	pub struct Transaction<'a> {
+		pub context: Option<Context<Converser<'a>>>,
+	}
+	
+	impl<'a> Transaction<'a> {
+		pub fn new() -> Self {
+			Transaction {
+				context: None,
+			}
+		}
+		
+		// TODO: Return better errors
+		pub fn begin<'s>(&'s mut self, source_passwd: &'a Passwd, target_passwd: &'a Passwd) -> Result<(), ()> {
+			// Start PAM context
+			let converser = Converser {
+				username: &source_passwd.name,
+			};
+			let mut context = Context::new("rsudoas", None, converser).expect("Failed to initialize PAM");
+			
+			// Set requesting user
+			context.set_ruser(Some(&source_passwd.name)).map_err(|_| ())?;
+			
+			// Set TTY
+			if let Ok(tty_path) = nix::unistd::ttyname(std::io::stdin()) {
+				if let Ok(tty) = tty_path.strip_prefix("/dev/") {
+					if let Some(tty) = tty.to_str() {
+						context.set_tty(Some(tty)).map_err(|_| ())?;
+					}
+				}
+			}
+			
+			// Authenticate
+			context.authenticate(Flag::NONE).map_err(|_| ())?;
+			
+			// Refresh auth token if required
+			if let Err(err) = context.acct_mgmt(Flag::NONE) {
+				let code = err.code();
+				if code == ErrorCode::NEW_AUTHTOK_REQD {
+					context.chauthtok(Flag::CHANGE_EXPIRED_AUTHTOK).map_err(|_| ())?;
+				} else {
+					// TODO: Display reason for authentication failure to the user
+					return Err(());
+				}
+			}
+			
+			// Set user
+			context.set_user(Some(&target_passwd.name)).map_err(|_| ())?;
+			
+			// Reinitialize credentials
+			context.reinitialize_credentials(Flag::NONE).map_err(|_| ())?;
+			
+			// Save context
+			self.context = Some(context);
+			
+			Ok(())
 		}
 	}
 }
