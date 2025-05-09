@@ -17,4 +17,5 @@ fn main() {
 		_ => panic!("AUTH_MODE is set to an invalid value!"),
 	}
 	println!("cargo::rustc-cfg=auth=\"{var}\"");
+	println!(r#"cargo::rustc-check-cfg=cfg(auth, values("none", "pam", "plain"))"#);
 }
