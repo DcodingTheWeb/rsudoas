@@ -25,6 +25,7 @@ use std::{
 use libc;
 use pwd_grp;
 use syslog_c::syslog;
+use nix;
 
 #[allow(unused_imports)]
 use rsudoas::{
@@ -100,7 +101,16 @@ fn execute(opts: Execute) {
 		Some(match_opts) => match_opts,
 	};
 	
-	let run = |cleanup: Option<Box<dyn FnOnce()>>| {
+	let run = |cleanup: Option<Box<dyn FnOnce()>>| -> Result<(), String> {
+		use nix::{
+			errno::Errno,
+			spawn,
+			sys::wait::{waitpid, WaitStatus},
+			unistd,
+		};
+		let mut exit_code = 1;
+		let mut exit_msg = None;
+		
 		if !rule_opts.nolog {
 			let cmdline = get_cmdline(&cmd, &opts.args);
 			let cwd = env::current_dir();
@@ -114,17 +124,10 @@ fn execute(opts: Execute) {
 		
 		let cmd_cstr;
 		unsafe {
-			libc::setenv(
-				CString::new("PATH").unwrap_unchecked().as_ptr(),
-				CString::new(SAFE_PATH).unwrap_unchecked().as_ptr(),
-				1,
-			);
+			env::set_var("PATH", SAFE_PATH);
 			cmd_cstr = CString::new(cmd.clone()).unwrap_unchecked();
 		}
 		let arg_cstrs: Vec<_> = opts.args.iter().map(|arg| CString::new(arg.as_bytes()).unwrap()).collect();
-		let mut arg_ptrs = vec![cmd_cstr.as_ptr()];
-		arg_ptrs.extend(arg_cstrs.iter().map(|arg| arg.as_ptr()));
-		arg_ptrs.push(ptr::null());
 		
 		let mut env_cstrs = vec![
 			env_cstr("DOAS_USER", &passwd.name),
@@ -156,39 +159,70 @@ fn execute(opts: Execute) {
 		let mut env_ptrs: Vec<_> = env_cstrs.iter().map(|arg| arg.as_ptr()).collect();
 		env_ptrs.push(ptr::null());
 		
-		unsafe {
-			if libc::setresgid(passwd_target.gid, passwd_target.gid, passwd_target.gid) != 0 {
-				print_error_and_exit("setresgid", 1);
-			}
-			let target_name = CString::new(passwd_target.name.clone()).unwrap();
-			if libc::initgroups(target_name.as_ptr(), passwd_target.gid) != 0 {
-				print_error_and_exit("initgroups", 1);
-			}
-			if libc::setresuid(passwd_target.uid, passwd_target.uid, passwd_target.uid) != 0 {
-				print_error_and_exit("setresuid", 1);
-			}
+		unistd::setresgid(passwd_target.gid.into(), passwd_target.gid.into(), passwd_target.gid.into())
+			.map_err(|e| format!("setresgid: {e}"))?;
+		let target_name = CString::new(passwd_target.name.clone())
+			.map_err(|_| "Invalid username".to_string())?;
+		unistd::initgroups(&target_name, passwd_target.gid.into())
+			.map_err(|e| format!("initgroups: {e}"))?;
+		unistd::setresuid(passwd_target.uid.into(), passwd_target.uid.into(), passwd_target.uid.into())
+			.map_err(|e| format!("setresuid: {e}"))?;
 			env::set_var("PATH", SAFE_PATH);
-			let child_pid = libc::fork();
-			match child_pid {
-				-1 => panic!("Failed to start child process!"),
-				0 => {
-					libc::execvpe(
-						cmd_cstr.as_ptr(),
-						arg_ptrs.as_ptr(),
-						env_ptrs.as_ptr(),
-					);
-				},
-				_ => (),
-			}
+		let child_pid = spawn::posix_spawnp(
+			cmd_cstr.as_c_str(),
+			&spawn::PosixSpawnFileActions::init()
+				.map_err(|e| format!("posix_spawn_file_actions_t: {e}"))?,
+			&spawn::PosixSpawnAttr::init()
+				.map_err(|e| format!("posix_spawnattr_t: {e}"))?,
+			&[&cmd_cstr] // Required because we are building a raw `argv`
+				.into_iter()
+				.chain(arg_cstrs.iter())
+				.map(|x| x.as_c_str())
+				.collect::<Vec<_>>(),
+			&env_cstrs
+				.iter()
+				.map(|x| x.as_c_str())
+				.collect::<Vec<_>>(),
+		).map_err(|e| format!("posix_spawnp: {e}"))?;
 			
+		loop {
 			// Wait for child to exit
-			libc::waitpid(child_pid, std::ptr::null::<libc::c_int>() as *mut i32, 0);
+			match waitpid(Some(child_pid), None) {
+				Ok(status) => match status {
+					WaitStatus::Exited(_, code) => {
+						// Pass the exit code
+						exit_code = code;
+						break;
+					},
+					WaitStatus::Signaled(_, signal, _) => {
+						exit_msg = Some(format!("{}: killed by signal {}", &cmd, signal.as_str()));
+						break;
+					},
+					_ => (), // Loop until exit
+				},
+				Err(errno) => {
+					if errno == Errno::ENOENT {
+						exit_msg = Some(format!("{}: command not found", &cmd));
+					} else {
+						exit_msg = Some(format!("waitpid: {}", errno.desc()));
+					}
+					break;
+				},
+			}
 		}
 		
 		if let Some(cleanup) = cleanup {
 			cleanup();
 		}
+		
+		if let Some(msg) = exit_msg {
+			print_error_and_exit(&msg, exit_code);
+		}
+		
+		Ok(())
 	};
+	
+	let run_result;
 	
 	#[cfg(auth = "none")]
 	{
@@ -197,7 +231,7 @@ fn execute(opts: Execute) {
 			return;
 		}
 		
-		run(None);
+		run_result = run(None);
 	}
 	
 	#[cfg(auth = "pam")]
@@ -223,7 +257,7 @@ fn execute(opts: Execute) {
 			}
 		}
 		
-		run(Some(Box::new(|| {
+		run_result = run(Some(Box::new(|| {
 			// Close the PAM session
 			if let Some(session) = pam_session {
 				let _ = session.close(pam_client::Flag::NONE);
@@ -249,7 +283,11 @@ fn execute(opts: Execute) {
 			}
 		}
 		
-		run(None);
+		run_result = run(None);
+	}
+	
+	if let Err(msg) = run_result {
+		print_error_and_exit(&format!("Error while trying to run: {msg}"), 1);
 	}
 	
 	fn env_cstr(key: &str, value: &str) -> CString {
