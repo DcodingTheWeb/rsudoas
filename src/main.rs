@@ -36,6 +36,7 @@ use rsudoas::{
 };
 
 const SAFE_PATH: &'static str = env!("SAFE_PATH");
+const DEFAULT_CONF: &'static str = include_str!(env!("DEFAULT_CONF_PATH"));
 
 fn main() {
 	let command = Command::new();
@@ -58,10 +59,33 @@ fn execute(opts: Execute) {
 			config_file = file;
 		},
 	}
-	let config = std::fs::read_to_string(config_file).expect("Failed to read config");
+	let config = std::fs::read_to_string(config_file).unwrap_or_else(|e| {
+		print_error(&format!("Failed to read config: {e}"));
+		if only_check || DEFAULT_CONF.is_empty() {
+			std::process::exit(1);
+		}
+		
+		print_error("Falling back to the following default safe conf:");
+		eprint!("{DEFAULT_CONF}");
+		
+		DEFAULT_CONF.into()
+	});
 	let rules = match Rules::try_from(&*config) {
 		Ok(x) => x,
-		Err(_) => print_error_and_exit("Error parsing config", 1),
+		Err(error) => {
+			print_error(&format!("Error parsing config: {error}"));
+			if !only_check && !DEFAULT_CONF.is_empty() {
+				print_error("Falling back to the following default safe conf:");
+				eprint!("{DEFAULT_CONF}");
+				
+				match Rules::try_from(DEFAULT_CONF) {
+					Ok(x) => x,
+					Err(error) => print_error_and_exit(&format!("Error parsing fallback config: {error}"), 1),
+				}
+			} else {
+				std::process::exit(1);
+			}
+		},
 	};
 	
 	let passwd = pwd_grp::getpwuid(pwd_grp::getuid()).unwrap().unwrap();

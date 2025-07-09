@@ -8,6 +8,10 @@ fn main() {
 	var = option_env!("SAFE_PATH").unwrap_or(SAFE_PATH);
 	println!("cargo::rustc-env=SAFE_PATH={var}");
 	
+	println!("cargo::rerun-if-env-changed=DEFAULT_CONF_PATH");
+	var = option_env!("DEFAULT_CONF_PATH").unwrap_or("/dev/null");
+	println!("cargo::rustc-env=DEFAULT_CONF_PATH={var}");
+	
 	println!("cargo::rerun-if-env-changed=AUTH_MODE");
 	var = option_env!("AUTH_MODE").unwrap_or(AUTH_MODE);
 	match var {

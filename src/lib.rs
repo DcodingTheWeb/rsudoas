@@ -251,9 +251,13 @@ pub mod command {
 		}
 	}
 	
-	pub fn print_error_and_exit(msg: &str, code: i32) -> ! {
+	pub fn print_error(msg: &str) {
 		let name = std::env::args().next().unwrap();
 		eprintln!("{name}: {}", msg);
+	}
+	
+	pub fn print_error_and_exit(msg: &str, code: i32) -> ! {
+		print_error(msg);
 		std::process::exit(code);
 	}
 }
