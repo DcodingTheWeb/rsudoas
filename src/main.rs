@@ -94,9 +94,9 @@ fn execute(opts: Execute) {
 		pwd_grp::getgrgid(*x).unwrap().unwrap().name
 	}));
 	let passwd_target = match pwd_grp::getpwnam(&opts.user) {
-	    Err(_) => print_error_and_exit("Failed to retrieve target user", 1),
-	    Ok(None) => print_error_and_exit("Target user does not exist", 1),
-	    Ok(Some(x)) => x,
+		Err(_) => print_error_and_exit("Failed to retrieve target user", 1),
+		Ok(None) => print_error_and_exit("Target user does not exist", 1),
+		Ok(Some(x)) => x,
 	};
 	let cmd = match opts.cmd {
 		Some(x) => x,
